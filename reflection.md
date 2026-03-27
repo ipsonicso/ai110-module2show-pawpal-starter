@@ -6,7 +6,13 @@
 
 - Briefly describe your initial UML design.
 - What classes did you include, and what responsibilities did you assign to each?
-
+- > Owner: Name, pets owned (links to pet), tasks completed / tasks,
+  > Tasks: Date, str task name, str description, and bool completed
+  >   > monthly/weekly grooming/vet checkup
+  >   > daily food, water
+  >   > other maintence may be SPECIES-specific (cat) so, is using AI later, maybe have draw fom I for a known animal group's anima
+  > Pet: name, owner (links to owner), >> attaches persistent tasks daily/monthly/yearly
+  
 **b. Design changes**
 
 - Did your design change during implementation?
