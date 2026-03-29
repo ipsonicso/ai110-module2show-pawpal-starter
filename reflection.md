@@ -12,12 +12,30 @@
   >   > daily food, water
   >   > other maintence may be SPECIES-specific (cat) so, is using AI later, maybe have draw fom I for a known animal group's anima
   > Pet: name, owner (links to owner), >> attaches persistent tasks daily/monthly/yearly
+ ^ with Claude
+ v with copilot not in-line, fleshed out using Claude
+
+Main/Original prompt classes
+> Owner 
+> Pet
+> Scheduler
+> Tasks
+and classes to fit needs of schedule/task coordination
+> Frequency
+> TimeWindow : start time, end time --> how many minutes/hours will it take
+> 
+ 
   
 **b. Design changes**
 
 - Did your design change during implementation?
 - If yes, describe at least one change and why you made it.
 
+From UML to stubs 
+> changed task creation from a method under pet to a method in Owner that 
+In checking stubs
+> changed how time logic because it was inconsistent and could allow errors when changing time zone
+From class stubs to classes
 ---
 
 ## 2. Scheduling Logic and Tradeoffs
