@@ -12,8 +12,9 @@ Key differences from models.py (v1):
 
 from __future__ import annotations
 
+import copy
 import uuid
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from enum import Enum
 from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -43,7 +44,10 @@ PRIORITY_RANK: dict[Priority, int] = {
 }
 
 
-def _validate_timezone_name(timezone_name: str) -> ZoneInfo:
+def _validate_timezone_name(timezone_name: str):  # -> ZoneInfo | timezone
+    # ZoneInfo('UTC') requires the tzdata package on some platforms.
+    if timezone_name.upper() == "UTC":
+        return UTC
     try:
         return ZoneInfo(timezone_name)
     except ZoneInfoNotFoundError as exc:
@@ -83,19 +87,48 @@ class TimeWindow:
 
 
 # ---------------------------------------------------------------------------
+# Weekly availability defaults
+# ---------------------------------------------------------------------------
+
+def _default_weekly_availability() -> dict[int, list[tuple[time, time]]]:
+    """Return a fresh copy of the default availability dict (0=Monday, 6=Sunday).
+
+    Weekdays: 6–9 AM (before work). Weekends: 8 AM–9 PM (open day).
+    """
+    weekday = [(time(6, 0), time(9, 0))]
+    weekend = [(time(8, 0), time(21, 0))]
+    return {0: list(weekday), 1: list(weekday), 2: list(weekday),
+            3: list(weekday), 4: list(weekday), 5: list(weekend), 6: list(weekend)}
+
+
+# ---------------------------------------------------------------------------
 # OwnerPreferences
 # ---------------------------------------------------------------------------
 
 class OwnerPreferences:
     def __init__(
         self,
-        preferred_task_types: Optional[list[str]] = None,
-        preferred_time_windows: Optional[list[TimeWindow]] = None,
         max_minutes_per_day: int = 480,
+        weekly_availability: Optional[dict[int, list[tuple[time, time]]]] = None,
     ) -> None:
-        self.preferred_task_types: list[str] = preferred_task_types or []
-        self.preferred_time_windows: list[TimeWindow] = preferred_time_windows or []
         self.max_minutes_per_day: int = max_minutes_per_day
+        # Keys 0–6 (Monday–Sunday); each value is a list of (start, end) time pairs.
+        self.weekly_availability: dict[int, list[tuple[time, time]]] = (
+            weekly_availability if weekly_availability is not None
+            else _default_weekly_availability()
+        )
+
+    def get_windows_for_date(self, target_date: date) -> list[TimeWindow]:
+        """Return TimeWindows for target_date based on the owner's weekly schedule."""
+        windows_for_day = self.weekly_availability.get(target_date.weekday(), [])
+        result = []
+        for start_t, end_t in windows_for_day:
+            base = datetime(target_date.year, target_date.month, target_date.day, tzinfo=UTC)
+            result.append(TimeWindow(
+                base.replace(hour=start_t.hour, minute=start_t.minute),
+                base.replace(hour=end_t.hour,   minute=end_t.minute),
+            ))
+        return result
 
     def __repr__(self) -> str:
         return f"OwnerPreferences(max_minutes_per_day={self.max_minutes_per_day})"
@@ -364,6 +397,10 @@ class Scheduler:
             return local_start.day == target_date.day
         return False
 
+    @staticmethod
+    def _within_any_window(start: datetime, end: datetime, windows: list[TimeWindow]) -> bool:
+        return any(w.start <= start and end <= w.end for w in windows)
+
     def generate_daily_schedule(
         self,
         owner: Owner,
@@ -372,20 +409,60 @@ class Scheduler:
     ) -> list[Task]:
         """
         Full scheduling pipeline:
-          collect → sort → assign slots → detect conflicts → return ordered list.
+          collect → assign slots (with priority-based conflict resolution) → detect conflicts.
+
+        Works on shallow copies of tasks so the originals' scheduled_start/end
+        are never mutated. Daily tasks whose pinned time falls outside the day's
+        availability windows are automatically re-queued for the next open slot.
         """
         tasks = [
-                        task
-                        for task in self.collect_tasks(owner)
-                        if self._is_due_on(task, target_date, owner._tzinfo)
+            copy.copy(task)
+            for task in self.collect_tasks(owner)
+            if self._is_due_on(task, target_date, owner._tzinfo)
         ]
-        tasks = self.sort_by_priority(tasks)
         tasks = self.assign_time_slots(tasks, available_windows)
-        return self.detect_conflicts(tasks)
+        tasks = self.detect_conflicts(tasks)
+        # Sort final list by scheduled start for display; unscheduled tasks go last
+        return sorted(
+            tasks,
+            key=lambda t: t.scheduled_start or datetime(9999, 1, 1, tzinfo=UTC),
+        )
 
     def sort_by_priority(self, tasks: list[Task]) -> list[Task]:
         """Return tasks ordered high → medium → low priority."""
         return sorted(tasks, key=lambda task: PRIORITY_RANK[task.priority])
+
+    @staticmethod
+    def _task_rank(task: Task) -> tuple[int, int]:
+        """
+        Combined sort key: lower = higher priority.
+          primary   — pinned first    (pinned=0, flexible=1)
+          secondary — priority level  (high=0, medium=1, low=2)
+        Result: pinned+high=0,0 … flexible+low=1,2
+        """
+        pin_rank = 0 if task.scheduled_start is not None else 1
+        return (pin_rank, PRIORITY_RANK[task.priority])
+
+    def _find_next_slot(
+        self,
+        duration: timedelta,
+        windows: list[TimeWindow],
+        committed: list[tuple[datetime, datetime]],
+    ) -> tuple[datetime, datetime] | None:
+        """Return the first (start, end) gap in windows not blocked by committed intervals."""
+        for window in windows:
+            cursor = window.start
+            while cursor + duration <= window.end:
+                proposed_end = cursor + duration
+                bump_to: datetime | None = None
+                for c_start, c_end in committed:
+                    if cursor < c_end and proposed_end > c_start:
+                        if bump_to is None or c_end > bump_to:
+                            bump_to = c_end
+                if bump_to is None:
+                    return cursor, proposed_end
+                cursor = bump_to
+        return None
 
     def assign_time_slots(
         self,
@@ -393,36 +470,66 @@ class Scheduler:
         available_windows: list[TimeWindow],
     ) -> list[Task]:
         """
-        Pack tasks into the provided time windows, setting each task's
-        scheduled_start and scheduled_end. Returns the updated task list.
+        Assign time slots using combined (priority, pinned) rank.
+
+        Tasks are processed best-rank first:
+          pinned+high → flexible+high → pinned+medium → … → flexible+low
+
+        A pinned task whose slot is already committed by a higher-ranked task
+        is demoted to flexible and re-queued for auto-assignment. This means
+        a high-priority flexible task can displace a lower-priority pinned task.
+        Demoted tasks are placed in the next available slot after all
+        higher-priority tasks are settled; tasks with no room stay unscheduled.
         """
         if not available_windows:
             return tasks
 
-        windows = sorted(available_windows, key=lambda window: window.start)
-        window_index = 0
-        current_time = windows[0].start
+        windows = sorted(available_windows, key=lambda w: w.start)
+        ordered = sorted(tasks, key=self._task_rank)
 
-        for task in tasks:
-            if task.scheduled_start is not None and task.scheduled_end is not None:
-                continue
+        committed: list[tuple[datetime, datetime]] = []
+        to_reschedule: list[Task] = []
 
-            duration = timedelta(minutes=task.duration_minutes)
-            while window_index < len(windows):
-                window = windows[window_index]
-                if current_time < window.start:
-                    current_time = window.start
+        for task in ordered:
+            if task.scheduled_start is not None:
+                # Daily tasks whose pinned time is outside today's windows get
+                # demoted to flexible so they land in the next available slot.
+                out_of_window = (
+                    task.frequency == Frequency.DAILY
+                    and bool(windows)
+                    and not self._within_any_window(
+                        task.scheduled_start, task.scheduled_end, windows
+                    )
+                )
+                overlap = any(
+                    task.scheduled_start < c_end and task.scheduled_end > c_start
+                    for c_start, c_end in committed
+                )
+                if not overlap and not out_of_window:
+                    committed.append((task.scheduled_start, task.scheduled_end))
+                else:
+                    # Demote: strip pinned time and re-queue
+                    task.scheduled_start = None
+                    task.scheduled_end = None
+                    to_reschedule.append(task)
+            else:
+                # Flexible — find first open slot
+                slot = self._find_next_slot(
+                    timedelta(minutes=task.duration_minutes), windows, committed
+                )
+                if slot:
+                    task.scheduled_start, task.scheduled_end = slot
+                    committed.append(slot)
 
-                proposed_end = current_time + duration
-                if proposed_end <= window.end:
-                    task.scheduled_start = current_time
-                    task.scheduled_end = proposed_end
-                    current_time = proposed_end
-                    break
-
-                window_index += 1
-                if window_index < len(windows):
-                    current_time = windows[window_index].start
+        # Place demoted tasks in whatever is left
+        for task in to_reschedule:
+            slot = self._find_next_slot(
+                timedelta(minutes=task.duration_minutes), windows, committed
+            )
+            if slot:
+                task.scheduled_start, task.scheduled_end = slot
+                committed.append(slot)
+            # else: stays unscheduled — surfaced in display as "no room"
 
         return tasks
 
@@ -445,7 +552,9 @@ class Scheduler:
             events.append((task.scheduled_start, 0, task))
             events.append((task.scheduled_end, 1, task))
 
-        events.sort(key=lambda item: (item[0], item[1]))
+        # At equal timestamps, process END events (1) before START events (0)
+        # so adjacent tasks (A ends at T, B starts at T) don't false-conflict.
+        events.sort(key=lambda item: (item[0], 1 - item[1]))
 
         active: set[str] = set()
         task_lookup = {task.id: task for task in scheduled_tasks}
