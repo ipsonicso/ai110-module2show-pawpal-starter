@@ -1,4 +1,3 @@
-#Skeleton layer..
 """
 PawPal+ data models — Version 2 (simplified, flat design).
 
@@ -170,6 +169,7 @@ class Task:
         )
         self.is_complete: bool = False
         self.conflict_flag: bool = False
+        self.rescheduled_flag: bool = False
 
         if self.scheduled_start and self.scheduled_end:
             if self.scheduled_start >= self.scheduled_end:
@@ -268,13 +268,7 @@ class Owner:
     ) -> Task:
         pet = self._get_pet_or_raise(pet_id)
 
-        start_utc: Optional[datetime] = None
-        end_utc: Optional[datetime] = None
-        if scheduled_start is not None:
-            start_utc = _ensure_aware_utc(scheduled_start, "scheduled_start")
-        if scheduled_end is not None:
-            end_utc = _ensure_aware_utc(scheduled_end, "scheduled_end")
-        if (start_utc is None) != (end_utc is None):
+        if (scheduled_start is None) != (scheduled_end is None):
             raise ValueError("scheduled_start and scheduled_end must be provided together")
 
         task = Task(
@@ -283,8 +277,8 @@ class Owner:
             duration_minutes=duration_minutes,
             priority=priority,
             frequency=frequency,
-            scheduled_start=start_utc,
-            scheduled_end=end_utc,
+            scheduled_start=scheduled_start,
+            scheduled_end=scheduled_end,
         )
         pet._add_task(task)
         return task
@@ -436,12 +430,15 @@ class Scheduler:
     def _task_rank(task: Task) -> tuple[int, int]:
         """
         Combined sort key: lower = higher priority.
-          primary   — pinned first    (pinned=0, flexible=1)
-          secondary — priority level  (high=0, medium=1, low=2)
-        Result: pinned+high=0,0 … flexible+low=1,2
+          primary   — priority level  (high=0, medium=1, low=2)
+          secondary — pinned first    (pinned=0, flexible=1)
+        Result: pinned+high=0,0 … flexible+low=2,1
+
+        Priority outranks pinned status, so a HIGH flexible task is processed
+        before a LOW pinned task and may claim its slot.
         """
         pin_rank = 0 if task.scheduled_start is not None else 1
-        return (pin_rank, PRIORITY_RANK[task.priority])
+        return (PRIORITY_RANK[task.priority], pin_rank)
 
     def _find_next_slot(
         self,
@@ -473,13 +470,13 @@ class Scheduler:
         Assign time slots using combined (priority, pinned) rank.
 
         Tasks are processed best-rank first:
-          pinned+high → flexible+high → pinned+medium → … → flexible+low
+          high+pinned → high+flexible → medium+pinned → … → low+flexible
 
-        A pinned task whose slot is already committed by a higher-ranked task
-        is demoted to flexible and re-queued for auto-assignment. This means
-        a high-priority flexible task can displace a lower-priority pinned task.
-        Demoted tasks are placed in the next available slot after all
-        higher-priority tasks are settled; tasks with no room stay unscheduled.
+        Priority outranks pinned status, so a HIGH flexible task is processed
+        before a LOW pinned task and may claim its slot. A displaced pinned task
+        is rescheduled to the next available slot and flagged with rescheduled_flag.
+        Equal-priority pinned tasks that overlap are left at their original times
+        and flagged by detect_conflicts. Tasks with no room stay unscheduled.
         """
         if not available_windows:
             return tasks
@@ -488,9 +485,11 @@ class Scheduler:
         ordered = sorted(tasks, key=self._task_rank)
 
         committed: list[tuple[datetime, datetime]] = []
+        committed_ranks: list[tuple[int, int]] = []
         to_reschedule: list[Task] = []
 
         for task in ordered:
+            task_rank = self._task_rank(task)
             if task.scheduled_start is not None:
                 # Daily tasks whose pinned time is outside today's windows get
                 # demoted to flexible so they land in the next available slot.
@@ -501,27 +500,39 @@ class Scheduler:
                         task.scheduled_start, task.scheduled_end, windows
                     )
                 )
-                overlap = any(
-                    task.scheduled_start < c_end and task.scheduled_end > c_start
-                    for c_start, c_end in committed
-                )
-                if not overlap and not out_of_window:
+                overlapping_ranks = [
+                    committed_ranks[i]
+                    for i in range(len(committed))
+                    if task.scheduled_start < committed[i][1]
+                    and task.scheduled_end > committed[i][0]
+                ]
+                if not overlapping_ranks and not out_of_window:
+                    # No conflict — commit as pinned.
                     committed.append((task.scheduled_start, task.scheduled_end))
-                else:
-                    # Demote: strip pinned time and re-queue
+                    committed_ranks.append(task_rank)
+                elif out_of_window or any(r < task_rank for r in overlapping_ranks):
+                    # Yield: daily task outside window OR a higher-priority task
+                    # already owns this slot. Reschedule and leave a warning.
+                    task.rescheduled_flag = True
                     task.scheduled_start = None
                     task.scheduled_end = None
                     to_reschedule.append(task)
+                else:
+                    # Equal-priority pinned conflict: keep original time so
+                    # detect_conflicts can flag both tasks.
+                    committed.append((task.scheduled_start, task.scheduled_end))
+                    committed_ranks.append(task_rank)
             else:
-                # Flexible — find first open slot
+                # Flexible — find first open slot.
                 slot = self._find_next_slot(
                     timedelta(minutes=task.duration_minutes), windows, committed
                 )
                 if slot:
                     task.scheduled_start, task.scheduled_end = slot
                     committed.append(slot)
+                    committed_ranks.append(task_rank)
 
-        # Place demoted tasks in whatever is left
+        # Place rescheduled tasks in whatever slots remain.
         for task in to_reschedule:
             slot = self._find_next_slot(
                 timedelta(minutes=task.duration_minutes), windows, committed
@@ -529,6 +540,7 @@ class Scheduler:
             if slot:
                 task.scheduled_start, task.scheduled_end = slot
                 committed.append(slot)
+                committed_ranks.append(self._task_rank(task))
             # else: stays unscheduled — surfaced in display as "no room"
 
         return tasks
@@ -575,14 +587,16 @@ class Scheduler:
         lines: list[str] = []
         for task in tasks:
             if task.scheduled_start is None or task.scheduled_end is None:
+                reschedule_note = " (originally pinned, no room found)" if task.rescheduled_flag else ""
                 lines.append(
-                    f"[unscheduled] {task.title} ({task.duration_minutes}m, {task.priority.value})"
+                    f"[unscheduled] {task.title} ({task.duration_minutes}m, {task.priority.value}){reschedule_note}"
                 )
                 continue
 
             conflict = " CONFLICT" if task.conflict_flag else ""
+            rescheduled = " (rescheduled)" if task.rescheduled_flag else ""
             lines.append(
                 f"{task.scheduled_start.isoformat()} - {task.scheduled_end.isoformat()} | "
-                f"{task.title} ({task.duration_minutes}m, {task.priority.value}){conflict}"
+                f"{task.title} ({task.duration_minutes}m, {task.priority.value}){conflict}{rescheduled}"
             )
         return "\n".join(lines)

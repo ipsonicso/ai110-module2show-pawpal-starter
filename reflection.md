@@ -129,4 +129,4 @@ I tested setting a recurring event to 8 to 9 AM daily but setting user availabil
 **c. Key takeaway**
 
 - What is one important thing you learned about designing systems or working with AI on this project?
-> You have to be very specific about what you want (and have a clear plan of how to ask it ahead of time) because, if you aren't from the start, it will keep trying to undo your suggestions at every step.
+> You have to be very specific about what you want because, if you aren't from the start, it will keep trying to undo your suggestions at every step. It's important to have a clear idea of the intended behavior ahead of time because giving examples of how you want it to works can help improve your code when using AI.

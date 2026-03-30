@@ -362,6 +362,14 @@ else:
                 "edit one of the pinned tasks above to fix this."
             )
 
+        rescheduled = [t for t in scheduled if t.rescheduled_flag]
+        if rescheduled:
+            names = ", ".join(f"**{t.title}**" for t in rescheduled)
+            st.warning(
+                f"{names} {'was' if len(rescheduled) == 1 else 'were'} moved to a new time "
+                "because a higher-priority task claimed the original slot."
+            )
+
         rows = []
         for t in scheduled:
             if t.scheduled_start and t.scheduled_end:
@@ -372,13 +380,19 @@ else:
             else:
                 time_str = "unscheduled (no room)"
 
+            status = ""
+            if t.conflict_flag:
+                status = "conflict"
+            elif t.rescheduled_flag:
+                status = "rescheduled"
+
             rows.append({
                 "Time (UTC)": time_str,
                 "Pet": pet_map.get(t.id, "?"),
                 "Task": t.title,
                 "Duration (min)": t.duration_minutes,
                 "Priority": t.priority.value,
-                "⚠️": "conflict" if t.conflict_flag else "",
+                "⚠️": status,
             })
 
         st.table(rows)
